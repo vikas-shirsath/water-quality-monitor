@@ -1,10 +1,11 @@
 from __future__ import annotations
-import base64, csv, hashlib, hmac, io, json, logging, os, time
+import base64, csv, hashlib, hmac, io, json, logging, os, smtplib, ssl, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ConfigDict
@@ -22,6 +23,12 @@ class Settings(BaseSettings):
     auth_username: str = 'admin'
     auth_password: str = 'water123'
     auth_token_secret: str = 'local-demo-secret-change-me'
+    alert_email_to: str = 'vikasshirsath04@gmail.com'
+    smtp_host: str = ''
+    smtp_port: int = 587
+    smtp_username: str = ''
+    smtp_password: str = ''
+    smtp_from_email: str = ''
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
 settings=Settings()
 if settings.app_env.lower()=='production' and (settings.auth_password=='water123' or settings.auth_token_secret=='local-demo-secret-change-me'):
@@ -117,9 +124,25 @@ def eval_alerts(db,r,ts):
         recent=db.scalars(select(AlertRow).where(AlertRow.device_id==r.device_id,AlertRow.parameter==parameter,AlertRow.resolved_at.is_(None)).order_by(AlertRow.created_at.desc()).limit(1)).first()
         if recent:continue
         a=AlertRow(device_id=r.device_id,parameter=parameter,value=value,threshold=limit,severity=severity,message=f'{parameter.upper()} {direction}',created_at=ts);db.add(a);created.append(a)
+    assessment=model_assessment(r)
+    if assessment and assessment['prediction']=='Poor':
+        recent_model=db.scalars(select(AlertRow).where(AlertRow.device_id==r.device_id,AlertRow.parameter=='model',AlertRow.resolved_at.is_(None)).order_by(AlertRow.created_at.desc()).limit(1)).first()
+        if not recent_model:
+            a=AlertRow(device_id=r.device_id,parameter='model',value=assessment['score'],threshold=50,severity='CRITICAL',message='Model predicts Poor water quality: treat as not drinkable pending laboratory confirmation.',created_at=ts);db.add(a);created.append(a)
     db.commit()
     for a in created:db.refresh(a);log.warning('Alert generated id=%s device=%s parameter=%s',a.id,a.device_id,a.parameter)
     return created
+def send_model_alert_email(alert:dict[str,Any]):
+    if not all((settings.smtp_host,settings.smtp_username,settings.smtp_password,settings.smtp_from_email)):
+        log.warning('Poor-quality alert email not sent: SMTP settings are incomplete')
+        return
+    msg=EmailMessage();msg['Subject']=f"Water quality alert: {alert['device_id']} predicted Poor";msg['From']=settings.smtp_from_email;msg['To']=settings.alert_email_to
+    msg.set_content(f"The water quality model predicted Poor for device {alert['device_id']}.\n\nModel score: {alert['value']:.1f}%\nReceived: {alert['created_at']}\n\nTreat this reading as a warning and avoid drinking the water until it has been tested appropriately. This experimental model is not a drinking-water safety certification.")
+    try:
+        with smtplib.SMTP(settings.smtp_host,settings.smtp_port,timeout=15) as server:
+            server.starttls(context=ssl.create_default_context());server.login(settings.smtp_username,settings.smtp_password);server.send_message(msg)
+        log.info('Poor-quality alert email sent recipient=%s alert_id=%s',settings.alert_email_to,alert['id'])
+    except Exception:log.exception('Unable to send poor-quality alert email alert_id=%s',alert.get('id'))
 @asynccontextmanager
 async def lifespan(app:FastAPI):
     Base.metadata.create_all(engine)
@@ -171,15 +194,17 @@ def list_readings(limit:int=Query(100,ge=1,le=1000),offset:int=Query(0,ge=0),dev
         items=db.scalars(q.order_by(ReadingRow.created_at.desc()).offset(offset).limit(limit)).all();total=len(db.scalars(countq).all())
         return {'items':[serialize(r) for r in reversed(items)],'total':total,'limit':limit,'offset':offset}
 @app.post('/api/readings',status_code=201)
-async def create_reading(payload:ReadingIn):
+async def create_reading(payload:ReadingIn,background_tasks:BackgroundTasks):
     ts=payload.created_at or datetime.now(timezone.utc)
     try:
         with Session() as db:
             d=db.get(DeviceRow,payload.device_id)
             if not d:d=DeviceRow(device_id=payload.device_id);db.add(d);db.flush()
             d.last_seen=ts;d.status='ONLINE';r=ReadingRow(device_id=payload.device_id,ph=payload.ph,tds=payload.tds,turbidity=payload.turbidity,temperature=payload.temperature,created_at=ts);db.add(r);db.commit();db.refresh(r);created=eval_alerts(db,r,ts);out=serialize(r);dev=serialize(d)
-        await manager.publish({'type':'reading.created','reading':out,'device':dev})
-        for a in created:await manager.publish({'type':'alert.created','alert':serialize(a)})
+        await manager.publish({'type':'reading.created','reading':out,'device':dev,'model_assessment':model_assessment(r)})
+        for a in created:
+            alert=serialize(a);await manager.publish({'type':'alert.created','alert':alert})
+            if a.parameter=='model':background_tasks.add_task(send_model_alert_email,alert)
         return out
     except Exception as e:log.exception('Incoming reading error');raise HTTPException(500,'Unable to store sensor reading') from e
 @app.get('/api/readings/export.csv')
