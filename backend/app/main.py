@@ -1,12 +1,12 @@
 from __future__ import annotations
-import csv, io, json, logging, os
+import base64, csv, hashlib, hmac, io, json, logging, os, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, create_engine, select
@@ -19,8 +19,13 @@ class Settings(BaseSettings):
     cors_origins: str = 'http://localhost:5173'
     app_env: str = 'development'
     log_level: str = 'INFO'
+    auth_username: str = 'admin'
+    auth_password: str = 'water123'
+    auth_token_secret: str = 'local-demo-secret-change-me'
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
 settings=Settings()
+if settings.app_env.lower()=='production' and (settings.auth_password=='water123' or settings.auth_token_secret=='local-demo-secret-change-me'):
+    raise RuntimeError('Set AUTH_PASSWORD and AUTH_TOKEN_SECRET to non-demo values in production.')
 logging.basicConfig(level=getattr(logging,settings.log_level.upper(),logging.INFO),format='%(asctime)s %(levelname)s %(name)s %(message)s')
 log=logging.getLogger('wqm')
 database_url=settings.database_url.strip()
@@ -48,6 +53,23 @@ def model_assessment(reading):
     predicted_index=int(probabilities.argmax())
     score=round(float(probabilities[predicted_index])*100,1)
     return {'score':score,'prediction':str(model.classes_[predicted_index]),'basis':'Supplied Water_Quality labels','is_certified':False}
+
+def _b64(data:bytes)->str:return base64.urlsafe_b64encode(data).decode().rstrip('=')
+def issue_token(username:str)->str:
+    payload=_b64(json.dumps({'sub':username,'exp':int(time.time())+86400},separators=(',',':')).encode())
+    signature=_b64(hmac.new(settings.auth_token_secret.encode(),payload.encode(),hashlib.sha256).digest())
+    return f'{payload}.{signature}'
+def token_username(token:str|None)->str|None:
+    try:
+        payload,signature=token.split('.',1)
+        expected=_b64(hmac.new(settings.auth_token_secret.encode(),payload.encode(),hashlib.sha256).digest())
+        if not hmac.compare_digest(signature,expected):return None
+        data=json.loads(base64.urlsafe_b64decode(payload+'='*(-len(payload)%4)))
+        if int(data['exp'])<=int(time.time()) or data['sub']!=settings.auth_username:return None
+        return str(data['sub'])
+    except (ValueError,KeyError,TypeError,json.JSONDecodeError):return None
+
+class LoginIn(BaseModel): username:str=Field(min_length=1,max_length=100);password:str=Field(min_length=1,max_length=200)
 class Base(DeclarativeBase): pass
 class DeviceRow(Base):
     __tablename__='devices'
@@ -109,9 +131,31 @@ async def lifespan(app:FastAPI):
     yield
 app=FastAPI(title='Smart Water Quality Monitor API',version='1.0.0',lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip().rstrip('/') for x in settings.cors_origins.split(',') if x.strip()],allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
+@app.middleware('http')
+async def require_login(request:Request,call_next):
+    path=request.url.path;method=request.method.upper()
+    open_request=(method=='OPTIONS' or path in {'/health','/api/health','/api/auth/login'} or (path=='/api/readings' and method=='POST'))
+    if path.startswith('/api/') and not open_request:
+        authorization=request.headers.get('authorization','')
+        scheme,_,token=authorization.partition(' ')
+        if scheme.lower()!='bearer' or token_username(token) is None:
+            return JSONResponse({'detail':'Authentication required'},status_code=401)
+    return await call_next(request)
 @app.get('/health')
 @app.get('/api/health')
 def health():return {'status':'ok','service':'wqm-api','time':datetime.now(timezone.utc).isoformat()}
+@app.post('/api/auth/login')
+def login(payload:LoginIn):
+    valid_user=hmac.compare_digest(payload.username,settings.auth_username)
+    valid_password=hmac.compare_digest(payload.password,settings.auth_password)
+    if not (valid_user and valid_password):raise HTTPException(401,'Incorrect username or password')
+    return {'access_token':issue_token(payload.username),'token_type':'bearer','expires_in':86400,'username':payload.username}
+@app.get('/api/auth/me')
+def current_user(request:Request):
+    token=request.headers.get('authorization','').partition(' ')[2]
+    username=token_username(token)
+    if not username:raise HTTPException(401,'Authentication required')
+    return {'username':username}
 @app.get('/api/dashboard')
 def dashboard():
     with Session() as db:
@@ -189,6 +233,8 @@ def analytics(parameter:str='ph',range:str='24H',device_id:str|None=None):
         return {'average':sum(values)/len(values) if values else 0,'minimum':min(values) if values else 0,'maximum':max(values) if values else 0,'violations':sum(violated(r) for r in rows),'readings':[serialize(r) for r in rows]}
 @app.websocket('/ws')
 async def websocket_endpoint(ws:WebSocket):
+    if token_username(ws.query_params.get('token')) is None:
+        await ws.close(code=4401);return
     await manager.connect(ws)
     try:
         while True:await ws.receive_text()
