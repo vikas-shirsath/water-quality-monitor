@@ -93,7 +93,8 @@ async def lifespan(app:FastAPI):
     log.info('WQM API started env=%s database=%s',settings.app_env,'configured')
     yield
 app=FastAPI(title='Smart Water Quality Monitor API',version='1.0.0',lifespan=lifespan)
-app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in settings.cors_origins.split(',') if x.strip()],allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
+app.add_middleware(CORSMiddleware,allow_origins=[x.strip().rstrip('/') for x in settings.cors_origins.split(',') if x.strip()],allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
+@app.get('/health')
 @app.get('/api/health')
 def health():return {'status':'ok','service':'wqm-api','time':datetime.now(timezone.utc).isoformat()}
 @app.get('/api/dashboard')
