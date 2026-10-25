@@ -9,10 +9,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, create_engine, select
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 class Settings(BaseSettings):
-    database_url: str = 'sqlite:///./wqm.db'
+    database_url: str
     cors_origins: str = 'http://localhost:5173'
     app_env: str = 'development'
     log_level: str = 'INFO'
@@ -20,8 +21,17 @@ class Settings(BaseSettings):
 settings=Settings()
 logging.basicConfig(level=getattr(logging,settings.log_level.upper(),logging.INFO),format='%(asctime)s %(levelname)s %(name)s %(message)s')
 log=logging.getLogger('wqm')
-connect_args={'check_same_thread':False} if settings.database_url.startswith('sqlite') else {}
-engine=create_engine(settings.database_url,pool_pre_ping=True,connect_args=connect_args)
+database_url=settings.database_url.strip()
+if database_url.startswith('postgres://'):
+    database_url='postgresql+psycopg://' + database_url.removeprefix('postgres://')
+elif database_url.startswith('postgresql://'):
+    database_url='postgresql+psycopg://' + database_url.removeprefix('postgresql://')
+if not database_url.startswith('postgresql+psycopg://'):
+    raise ValueError('DATABASE_URL must be a PostgreSQL URL using the psycopg driver.')
+parsed_url=make_url(database_url)
+if 'sslmode' not in parsed_url.query:
+    parsed_url=parsed_url.set(query={**dict(parsed_url.query),'sslmode':'require'})
+engine=create_engine(parsed_url,pool_pre_ping=True)
 Session=sessionmaker(engine,expire_on_commit=False)
 class Base(DeclarativeBase): pass
 class DeviceRow(Base):

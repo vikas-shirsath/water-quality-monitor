@@ -10,7 +10,7 @@ ESP32 / Wokwi → HTTP(S) → FastAPI → SQLAlchemy → PostgreSQL (Supabase)
                                   React dashboard
 ```
 
-The browser never connects to Supabase or PostgreSQL. All application reads and writes pass through FastAPI. The backend can run against SQLite locally or a Supabase PostgreSQL URL.
+The browser never connects to Supabase or PostgreSQL. All application reads and writes pass through FastAPI. Supabase PostgreSQL is the only supported database.
 
 ## Stack and layout
 
@@ -47,7 +47,7 @@ Backend `backend/.env`:
 
 | Variable | Purpose |
 |---|---|
-| `DATABASE_URL` | SQLAlchemy database URL; local default is SQLite |
+| `DATABASE_URL` | Supabase PostgreSQL connection URL (Session pooler for IPv4-only networks) |
 | `CORS_ORIGINS` | Comma-separated allowed browser origins |
 | `APP_ENV` | Environment name |
 | `LOG_LEVEL` | Python log level |

@@ -4,8 +4,12 @@ from datetime import datetime,timedelta,timezone
 from app.main import Base,DeviceRow,ReadingRow,AlertRow,ThresholdRow,Session,engine
 Base.metadata.create_all(engine);random.seed(14)
 with Session() as db:
-    d=db.get(DeviceRow,'WQM-001') or DeviceRow(device_id='WQM-001',name='North basin sensor',firmware_version='1.2.4',sampling_interval=30,status='ONLINE')
-    db.add(d);db.merge(ThresholdRow(id=1))
+    d=db.get(DeviceRow,'WQM-001')
+    if not d:
+        d=DeviceRow(device_id='WQM-001',name='North basin sensor',firmware_version='1.2.4',sampling_interval=30,status='ONLINE')
+    d.status='ONLINE';d.last_seen=datetime.now(timezone.utc)
+    db.add(d)
+    if not db.get(ThresholdRow,1):db.add(ThresholdRow(id=1))
     if not db.query(ReadingRow).first():
         now=datetime.now(timezone.utc)
         for i in range(432):
