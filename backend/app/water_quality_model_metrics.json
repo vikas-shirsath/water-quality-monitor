@@ -1,0 +1,55 @@
+{
+  "rows": 450,
+  "holdout_rows": 90,
+  "accuracy": 0.933333,
+  "macro_f1": 0.730507,
+  "classification_report": {
+    "Good": {
+      "precision": 0.3333333333333333,
+      "recall": 0.5,
+      "f1-score": 0.4,
+      "support": 2.0
+    },
+    "Moderate": {
+      "precision": 0.8125,
+      "recall": 0.8125,
+      "f1-score": 0.8125,
+      "support": 16.0
+    },
+    "Poor": {
+      "precision": 0.9859154929577465,
+      "recall": 0.9722222222222222,
+      "f1-score": 0.9790209790209791,
+      "support": 72.0
+    },
+    "accuracy": 0.9333333333333333,
+    "macro avg": {
+      "precision": 0.7105829420970267,
+      "recall": 0.7615740740740741,
+      "f1-score": 0.7305069930069931,
+      "support": 90.0
+    },
+    "weighted avg": {
+      "precision": 0.940584246218049,
+      "recall": 0.9333333333333333,
+      "f1-score": 0.9365501165501166,
+      "support": 90.0
+    }
+  },
+  "class_counts": {
+    "Good": 10,
+    "Moderate": 82,
+    "Poor": 358
+  },
+  "features_used": [
+    "pH",
+    "TDS_ppm",
+    "Turbidity_NTU",
+    "Temperature_C"
+  ],
+  "omitted_dataset_features": [
+    "Conductivity_uS_cm",
+    "Dissolved_Oxygen_mg_L"
+  ],
+  "validation_note": "Random stratified holdout; only 10 Good samples are present, so this score is highly uncertain. Dataset has no timestamps or device/source identifiers."
+}

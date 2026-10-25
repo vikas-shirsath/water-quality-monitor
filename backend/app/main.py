@@ -2,6 +2,7 @@ from __future__ import annotations
 import csv, io, json, logging, os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, create_engine, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+import joblib
 
 class Settings(BaseSettings):
     database_url: str
@@ -33,6 +35,19 @@ if 'sslmode' not in parsed_url.query:
     parsed_url=parsed_url.set(query={**dict(parsed_url.query),'sslmode':'require'})
 engine=create_engine(parsed_url,pool_pre_ping=True)
 Session=sessionmaker(engine,expire_on_commit=False)
+MODEL_PATH=Path(__file__).with_name('water_quality_model.joblib')
+_model_bundle=None
+def model_assessment(reading):
+    """Return the supplied dataset's Safe-label probability, never a safety certification."""
+    global _model_bundle
+    if reading is None or not MODEL_PATH.exists():return None
+    if _model_bundle is None:_model_bundle=joblib.load(MODEL_PATH)
+    model=_model_bundle['model'];features=_model_bundle['features']
+    values={'pH':reading.ph,'TDS_ppm':reading.tds,'Turbidity_NTU':reading.turbidity,'Temperature_C':reading.temperature}
+    probabilities=model.predict_proba([[values[name] for name in features]])[0]
+    predicted_index=int(probabilities.argmax())
+    score=round(float(probabilities[predicted_index])*100,1)
+    return {'score':score,'prediction':str(model.classes_[predicted_index]),'basis':'Supplied Water_Quality labels','is_certified':False}
 class Base(DeclarativeBase): pass
 class DeviceRow(Base):
     __tablename__='devices'
@@ -103,7 +118,7 @@ def dashboard():
         r=db.scalars(select(ReadingRow).order_by(ReadingRow.created_at.desc()).limit(1)).first();device=db.get(DeviceRow,r.device_id if r else 'WQM-001');cutoff=datetime.now(timezone.utc)-timedelta(seconds=(device.sampling_interval*3 if device else 90))
         if device and device.last_seen.replace(tzinfo=timezone.utc)<cutoff:device.status='OFFLINE';db.commit()
         t=thresholds(db);alerts=db.scalars(select(AlertRow).order_by(AlertRow.created_at.desc()).limit(5)).all()
-        return {'reading':serialize(r) if r else None,'device':serialize(device) if device else None,'alerts':[serialize(a) for a in alerts],'thresholds':serialize(t),'system_status':device.status if device else 'OFFLINE'}
+        return {'reading':serialize(r) if r else None,'device':serialize(device) if device else None,'alerts':[serialize(a) for a in alerts],'thresholds':serialize(t),'system_status':device.status if device else 'OFFLINE','model_assessment':model_assessment(r)}
 @app.get('/api/readings')
 def list_readings(limit:int=Query(100,ge=1,le=1000),offset:int=Query(0,ge=0),device_id:str|None=None):
     with Session() as db:
