@@ -1,5 +1,5 @@
 import type { Alert, AnalyticsResponse, DashboardSummary, Device, Reading, Threshold } from '../types';
-const base = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+const base = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
 async function request<T>(path:string, init?:RequestInit):Promise<T>{const r=await fetch(`${base}${path}`,{...init,headers:{'Content-Type':'application/json',...init?.headers}});if(!r.ok)throw new Error(`API ${r.status}: ${await r.text()}`);return r.json();}
 export const api={
  dashboard:()=>request<DashboardSummary>('/api/dashboard'),
