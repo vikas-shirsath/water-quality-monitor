@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, create_engine, select
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 import joblib
@@ -50,7 +50,7 @@ Session=sessionmaker(engine,expire_on_commit=False)
 MODEL_PATH=Path(__file__).with_name('water_quality_model.joblib')
 _model_bundle=None
 def model_assessment(reading):
-    """Return the supplied dataset's Safe-label probability, never a safety certification."""
+    """Return the supplied dataset's top-category score, never a safety certification."""
     global _model_bundle
     if reading is None or not MODEL_PATH.exists():return None
     if _model_bundle is None:_model_bundle=joblib.load(MODEL_PATH)
@@ -86,7 +86,7 @@ class ReadingRow(Base):
     id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True);device_id:Mapped[str]=mapped_column(ForeignKey('devices.device_id'),index=True);ph:Mapped[float]=mapped_column(Float);tds:Mapped[float]=mapped_column(Float);turbidity:Mapped[float]=mapped_column(Float);temperature:Mapped[float]=mapped_column(Float);created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc),index=True)
 class AlertRow(Base):
     __tablename__='alerts'
-    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True);device_id:Mapped[str]=mapped_column(String(80),index=True);parameter:Mapped[str]=mapped_column(String(30));value:Mapped[float]=mapped_column(Float);threshold:Mapped[float]=mapped_column(Float);severity:Mapped[str]=mapped_column(String(16));message:Mapped[str]=mapped_column(String(255));created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc),index=True);acknowledged:Mapped[bool]=mapped_column(Boolean,default=False);resolved_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True);device_id:Mapped[str]=mapped_column(String(80),index=True);parameter:Mapped[str]=mapped_column(String(30));value:Mapped[float]=mapped_column(Float);threshold:Mapped[float]=mapped_column(Float);severity:Mapped[str]=mapped_column(String(16));message:Mapped[str]=mapped_column(String(255));created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc),index=True);acknowledged:Mapped[bool]=mapped_column(Boolean,default=False);resolved_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True);email_last_attempt_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True);email_sent_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True)
 class ThresholdRow(Base):
     __tablename__='thresholds'
     id:Mapped[int]=mapped_column(Integer,primary_key=True,default=1);ph_min:Mapped[float]=mapped_column(Float,default=6.5);ph_max:Mapped[float]=mapped_column(Float,default=8.5);tds_max:Mapped[float]=mapped_column(Float,default=500);turbidity_max:Mapped[float]=mapped_column(Float,default=5);temperature_min:Mapped[float]=mapped_column(Float,default=10);temperature_max:Mapped[float]=mapped_column(Float,default=35)
@@ -124,14 +124,21 @@ def eval_alerts(db,r,ts):
         recent=db.scalars(select(AlertRow).where(AlertRow.device_id==r.device_id,AlertRow.parameter==parameter,AlertRow.resolved_at.is_(None)).order_by(AlertRow.created_at.desc()).limit(1)).first()
         if recent:continue
         a=AlertRow(device_id=r.device_id,parameter=parameter,value=value,threshold=limit,severity=severity,message=f'{parameter.upper()} {direction}',created_at=ts);db.add(a);created.append(a)
-    assessment=model_assessment(r)
+    assessment=model_assessment(r);email_alert=None
     if assessment and assessment['prediction']=='Poor':
         recent_model=db.scalars(select(AlertRow).where(AlertRow.device_id==r.device_id,AlertRow.parameter=='model',AlertRow.resolved_at.is_(None)).order_by(AlertRow.created_at.desc()).limit(1)).first()
         if not recent_model:
-            a=AlertRow(device_id=r.device_id,parameter='model',value=assessment['score'],threshold=50,severity='CRITICAL',message='Model predicts Poor water quality: treat as not drinkable pending laboratory confirmation.',created_at=ts);db.add(a);created.append(a)
+            recent_model=AlertRow(device_id=r.device_id,parameter='model',value=assessment['score'],threshold=50,severity='CRITICAL',message='Model predicts Poor water quality: treat as not drinkable pending laboratory confirmation.',created_at=ts);db.add(recent_model);created.append(recent_model)
+        else:recent_model.value=assessment['score']
+        smtp_configured=all((settings.smtp_host,settings.smtp_username,settings.smtp_password,settings.smtp_from_email))
+        last_attempt=recent_model.email_last_attempt_at
+        retry_due=last_attempt is None or (ts-(last_attempt.replace(tzinfo=timezone.utc) if last_attempt.tzinfo is None else last_attempt))>=timedelta(minutes=10)
+        if smtp_configured and recent_model.email_sent_at is None and retry_due:
+            recent_model.email_last_attempt_at=ts;email_alert=recent_model
     db.commit()
     for a in created:db.refresh(a);log.warning('Alert generated id=%s device=%s parameter=%s',a.id,a.device_id,a.parameter)
-    return created
+    if email_alert:db.refresh(email_alert)
+    return created,serialize(email_alert) if email_alert else None
 def send_model_alert_email(alert:dict[str,Any]):
     if not all((settings.smtp_host,settings.smtp_username,settings.smtp_password,settings.smtp_from_email)):
         log.warning('Poor-quality alert email not sent: SMTP settings are incomplete')
@@ -141,11 +148,17 @@ def send_model_alert_email(alert:dict[str,Any]):
     try:
         with smtplib.SMTP(settings.smtp_host,settings.smtp_port,timeout=15) as server:
             server.starttls(context=ssl.create_default_context());server.login(settings.smtp_username,settings.smtp_password);server.send_message(msg)
+        with Session() as db:
+            row=db.get(AlertRow,int(alert['id']))
+            if row:row.email_sent_at=datetime.now(timezone.utc);db.commit()
         log.info('Poor-quality alert email sent recipient=%s alert_id=%s',settings.alert_email_to,alert['id'])
     except Exception:log.exception('Unable to send poor-quality alert email alert_id=%s',alert.get('id'))
 @asynccontextmanager
 async def lifespan(app:FastAPI):
     Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(text('ALTER TABLE alerts ADD COLUMN IF NOT EXISTS email_last_attempt_at TIMESTAMPTZ'))
+        connection.execute(text('ALTER TABLE alerts ADD COLUMN IF NOT EXISTS email_sent_at TIMESTAMPTZ'))
     with Session() as db:
         thresholds(db)
         if not db.get(DeviceRow,'WQM-001'):
@@ -196,12 +209,14 @@ def list_readings(limit:int=Query(100,ge=1,le=1000),offset:int=Query(0,ge=0),dev
 @app.post('/api/readings',status_code=201)
 async def create_reading(payload:ReadingIn,background_tasks:BackgroundTasks):
     ts=payload.created_at or datetime.now(timezone.utc)
+    if ts.tzinfo is None:ts=ts.replace(tzinfo=timezone.utc)
     try:
         with Session() as db:
             d=db.get(DeviceRow,payload.device_id)
             if not d:d=DeviceRow(device_id=payload.device_id);db.add(d);db.flush()
-            d.last_seen=ts;d.status='ONLINE';r=ReadingRow(device_id=payload.device_id,ph=payload.ph,tds=payload.tds,turbidity=payload.turbidity,temperature=payload.temperature,created_at=ts);db.add(r);db.commit();db.refresh(r);created=eval_alerts(db,r,ts);out=serialize(r);dev=serialize(d)
+            d.last_seen=ts;d.status='ONLINE';r=ReadingRow(device_id=payload.device_id,ph=payload.ph,tds=payload.tds,turbidity=payload.turbidity,temperature=payload.temperature,created_at=ts);db.add(r);db.commit();db.refresh(r);created,email_alert=eval_alerts(db,r,ts);out=serialize(r);dev=serialize(d)
         await manager.publish({'type':'reading.created','reading':out,'device':dev,'model_assessment':model_assessment(r)})
+        if email_alert:background_tasks.add_task(send_model_alert_email,email_alert)
         for a in created:
             alert=serialize(a);await manager.publish({'type':'alert.created','alert':alert})
             if a.parameter=='model':background_tasks.add_task(send_model_alert_email,alert)
