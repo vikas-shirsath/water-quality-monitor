@@ -1,10 +1,11 @@
 from __future__ import annotations
-import base64, csv, hashlib, hmac, io, json, logging, os, smtplib, ssl, time
+import base64, csv, hashlib, hmac, io, json, logging, os, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request as UrlRequest, urlopen
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -24,11 +25,9 @@ class Settings(BaseSettings):
     auth_password: str = 'water123'
     auth_token_secret: str = 'local-demo-secret-change-me'
     alert_email_to: str = 'vikasshirsath04@gmail.com'
-    smtp_host: str = ''
-    smtp_port: int = 587
-    smtp_username: str = ''
-    smtp_password: str = ''
-    smtp_from_email: str = ''
+    brevo_api_key: str = ''
+    brevo_sender_email: str = ''
+    brevo_sender_name: str = 'Hydroliq Water Monitor'
     default_turbidity_ntu: float = Field(default=2.8, ge=0, le=10000)
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
 settings=Settings()
@@ -131,39 +130,65 @@ def eval_alerts(db,r,ts):
         if not recent_model:
             recent_model=AlertRow(device_id=r.device_id,parameter='model',value=assessment['score'],threshold=50,severity='CRITICAL',message='Model predicts Poor water quality: treat as not drinkable pending laboratory confirmation.',created_at=ts);db.add(recent_model);created.append(recent_model)
         else:recent_model.value=assessment['score']
-        smtp_configured=all((settings.smtp_host,settings.smtp_username,settings.smtp_password,settings.smtp_from_email))
+        email_api_configured=all((settings.brevo_api_key,settings.brevo_sender_email))
         last_attempt=recent_model.email_last_attempt_at
         retry_due=last_attempt is None or (ts-(last_attempt.replace(tzinfo=timezone.utc) if last_attempt.tzinfo is None else last_attempt))>=timedelta(seconds=30)
-        if smtp_configured and recent_model.email_sent_at is None and retry_due:
+        if email_api_configured and recent_model.email_sent_at is None and retry_due:
             recent_model.email_last_attempt_at=ts;recent_model.email_last_error=None;email_alert=recent_model
     db.commit()
     for a in created:db.refresh(a);log.warning('Alert generated id=%s device=%s parameter=%s',a.id,a.device_id,a.parameter)
     if email_alert:db.refresh(email_alert)
     return created,serialize(email_alert) if email_alert else None
 def send_model_alert_email(alert:dict[str,Any]):
-    if not all((settings.smtp_host,settings.smtp_username,settings.smtp_password,settings.smtp_from_email)):
-        log.warning('Poor-quality alert email not sent: SMTP settings are incomplete')
+    if not all((settings.brevo_api_key,settings.brevo_sender_email)):
+        log.warning('Poor-quality alert email not sent: Brevo API settings are incomplete')
         return
-    msg=EmailMessage();msg['Subject']=f"Water quality alert: {alert['device_id']} predicted Poor";msg['From']=settings.smtp_from_email;msg['To']=settings.alert_email_to
-    msg.set_content(f"The water quality model predicted Poor for device {alert['device_id']}.\n\nModel score: {alert['value']:.1f}%\nReceived: {alert['created_at']}\n\nTreat this reading as a warning and avoid drinking the water until it has been tested appropriately. This experimental model is not a drinking-water safety certification.")
+    message={
+        'sender':{'name':settings.brevo_sender_name,'email':settings.brevo_sender_email},
+        'to':[{'email':settings.alert_email_to}],
+        'subject':f"Water quality alert: {alert['device_id']} predicted Poor",
+        'textContent':(
+            f"The water quality model predicted Poor for device {alert['device_id']}.\n\n"
+            f"Model score: {alert['value']:.1f}%\nReceived: {alert['created_at']}\n\n"
+            'Treat this reading as a warning and avoid drinking the water until it has been tested appropriately. '
+            'This experimental model is not a drinking-water safety certification.'
+        ),
+    }
+    request=UrlRequest(
+        'https://api.brevo.com/v3/smtp/email',
+        data=json.dumps(message).encode('utf-8'),
+        headers={'accept':'application/json','api-key':settings.brevo_api_key,'content-type':'application/json'},
+        method='POST',
+    )
     try:
-        with smtplib.SMTP(settings.smtp_host,settings.smtp_port,timeout=15) as server:
-            server.starttls(context=ssl.create_default_context());server.login(settings.smtp_username,settings.smtp_password);server.send_message(msg)
+        with urlopen(request,timeout=20) as response:
+            result=json.loads(response.read().decode('utf-8'))
+        provider_message_id=result.get('messageId','unknown') if isinstance(result,dict) else 'unknown'
         with Session() as db:
             row=db.get(AlertRow,int(alert['id']))
             if row:row.email_sent_at=datetime.now(timezone.utc);row.email_last_error=None;db.commit()
-        log.info('Poor-quality alert email sent recipient=%s alert_id=%s',settings.alert_email_to,alert['id'])
-    except Exception as error:
-        if isinstance(error,smtplib.SMTPAuthenticationError):hint='SMTP authentication failed. Check SMTP_USERNAME and use a fresh Gmail App Password.'
-        elif isinstance(error,smtplib.SMTPRecipientsRefused):hint='SMTP rejected ALERT_EMAIL_TO. Check the recipient address.'
-        elif isinstance(error,smtplib.SMTPSenderRefused):hint='SMTP rejected SMTP_FROM_EMAIL. Check that it matches the authenticated sender.'
-        elif isinstance(error,(smtplib.SMTPConnectError,smtplib.SMTPServerDisconnected,TimeoutError,ConnectionError,ssl.SSLError)):hint='Could not establish SMTP/TLS connection. Check SMTP_HOST, SMTP_PORT, and TLS access.'
-        elif isinstance(error,smtplib.SMTPException):hint=f'SMTP delivery failed ({type(error).__name__}). Check the SMTP settings and Render logs.'
-        else:hint=f'Email delivery failed ({type(error).__name__}). Check Render logs.'
+        log.info('Brevo accepted poor-quality alert email recipient=%s alert_id=%s message_id=%s',settings.alert_email_to,alert['id'],provider_message_id)
+    except HTTPError as error:
+        try:detail=error.read().decode('utf-8','replace')[:180]
+        except Exception:detail='No response body'
+        hint=f'Brevo API rejected the request (HTTP {error.code}): {detail}'
         with Session() as db:
             row=db.get(AlertRow,int(alert['id']))
-            if row:row.email_last_error=hint;db.commit()
-        log.error('Unable to send poor-quality alert email alert_id=%s error_type=%s hint=%s',alert.get('id'),type(error).__name__,hint)
+            if row:row.email_last_error=hint[:255];db.commit()
+        log.error('Brevo rejected poor-quality alert email alert_id=%s http_status=%s detail=%s',alert.get('id'),error.code,detail)
+    except URLError as error:
+        reason=str(getattr(error,'reason',error))[:160]
+        hint=f'Could not connect to Brevo HTTPS API: {reason}'
+        with Session() as db:
+            row=db.get(AlertRow,int(alert['id']))
+            if row:row.email_last_error=hint[:255];db.commit()
+        log.error('Unable to reach Brevo HTTPS API alert_id=%s reason=%s',alert.get('id'),reason)
+    except Exception as error:
+        hint=f'Email API request failed ({type(error).__name__}): {str(error)[:180]}'
+        with Session() as db:
+            row=db.get(AlertRow,int(alert['id']))
+            if row:row.email_last_error=hint[:255];db.commit()
+        log.error('Unable to send poor-quality alert email alert_id=%s error_type=%s detail=%s',alert.get('id'),type(error).__name__,str(error)[:180])
 @asynccontextmanager
 async def lifespan(app:FastAPI):
     Base.metadata.create_all(engine)
