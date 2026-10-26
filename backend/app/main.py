@@ -133,7 +133,7 @@ def eval_alerts(db,r,ts):
         else:recent_model.value=assessment['score']
         smtp_configured=all((settings.smtp_host,settings.smtp_username,settings.smtp_password,settings.smtp_from_email))
         last_attempt=recent_model.email_last_attempt_at
-        retry_due=last_attempt is None or (ts-(last_attempt.replace(tzinfo=timezone.utc) if last_attempt.tzinfo is None else last_attempt))>=timedelta(minutes=10)
+        retry_due=last_attempt is None or (ts-(last_attempt.replace(tzinfo=timezone.utc) if last_attempt.tzinfo is None else last_attempt))>=timedelta(seconds=30)
         if smtp_configured and recent_model.email_sent_at is None and retry_due:
             recent_model.email_last_attempt_at=ts;recent_model.email_last_error=None;email_alert=recent_model
     db.commit()
