@@ -1,6 +1,6 @@
 export type Parameter = 'ph' | 'tds' | 'turbidity' | 'temperature';
 export type Reading = { id: number; device_id: string; ph: number; tds: number; turbidity: number; temperature: number; created_at: string };
-export type Alert = { id: number; device_id: string; parameter: Parameter|'model'; value: number; threshold: number; severity: 'INFO'|'WARNING'|'CRITICAL'; message: string; created_at: string; acknowledged: boolean; resolved_at?: string|null };
+export type Alert = { id: number; device_id: string; parameter: Parameter|'model'; value: number; threshold: number; severity: 'INFO'|'WARNING'|'CRITICAL'; message: string; created_at: string; acknowledged: boolean; resolved_at?: string|null; email_last_attempt_at?: string|null; email_sent_at?: string|null };
 export type Device = { device_id: string; name: string; status: 'ONLINE'|'OFFLINE'; ip_address?: string|null; last_seen: string; firmware_version: string; sampling_interval: number; created_at: string };
 export type Threshold = { ph_min:number;ph_max:number;tds_max:number;turbidity_max:number;temperature_min:number;temperature_max:number };
 export type ModelAssessment = { score:number; prediction:'Good'|'Moderate'|'Poor'; basis:string; is_certified:false };
