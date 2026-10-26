@@ -1,12 +1,9 @@
 # ESP32 firmware setup
 
-Open `water_quality_monitor.ino` in Arduino IDE with an ESP32 board/core installed. Install the `OneWire` and `DallasTemperature` libraries; `WiFi`, `WiFiClientSecure`, and `HTTPClient` come with the ESP32 Arduino core. Copy `secrets.h.example` to `secrets.h` in this folder and edit the Wi-Fi values there. `secrets.h` is ignored by Git so the credentials won't be committed.
+The complete firmware is in one file: `water_quality_monitor.ino`. Open it in Arduino IDE. No `secrets.h` or certificate header is required; the sketch contains the HTTPS certificate and editable Wi-Fi placeholders.
 
-Before flashing:
+Install the Espressif ESP32 board package and the `OneWire` and `DallasTemperature` libraries. The ESP32 Arduino board package supplies `WiFi`, `WiFiClientSecure`, and `HTTPClient`.
 
-1. Set `WIFI_SSID` and `WIFI_PASSWORD` in `secrets.h`. Use a 2.4 GHz Wi-Fi network; the original ESP32 does not connect to 5 GHz. For Wokwi, use `Wokwi-GUEST` and an empty password.
-2. Calibrate `PH7_VOLTAGE` and `PH4_VOLTAGE` from the actual probe readings in pH 7 and pH 4 buffer solutions.
-3. Match `TURBIDITY_USES_DIVIDER` to the wiring. Keep every analog voltage at the ESP32 ADC pin within its electrical limits and connect sensor/ESP32 grounds.
-4. Leave `API_URL` pointed at the public FastAPI `/api/readings` endpoint. Do not use `localhost` and do not put Supabase credentials in firmware.
+Before uploading, edit `WIFI_SSID`, `WIFI_PASSWORD`, `PH7_VOLTAGE`, and `PH4_VOLTAGE` in the sketch. Use a 2.4 GHz Wi-Fi network. Calibrate the pH voltages using pH 7 and pH 4 buffer solutions, measured at the ESP32 input after any divider. Match `TURBIDITY_USES_DIVIDER` to your wiring. Keep every ESP32 analog input between 0 and 3.3 V and connect sensor and board grounds.
 
-The sketch syncs the clock with NTP so HTTPS certificate dates can be checked, then sends one JSON POST every 30 seconds. The API assigns the UTC timestamp, stores each measurement in Supabase, evaluates thresholds, and emits WebSocket events for the dashboard. `ca_certificate.h` contains the current root from the verified Render certificate chain; update it if Render changes certificate authorities.
+The sketch syncs time with NTP, validates Render HTTPS using its bundled root CA, and posts readings every 30 seconds to `/api/readings`. Do not replace the public backend URL with `localhost` or put Supabase credentials in the firmware. The backend stores readings in Supabase and updates the dashboard.
