@@ -86,7 +86,7 @@ class ReadingRow(Base):
     id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True);device_id:Mapped[str]=mapped_column(ForeignKey('devices.device_id'),index=True);ph:Mapped[float]=mapped_column(Float);tds:Mapped[float]=mapped_column(Float);turbidity:Mapped[float]=mapped_column(Float);temperature:Mapped[float]=mapped_column(Float);created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc),index=True)
 class AlertRow(Base):
     __tablename__='alerts'
-    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True);device_id:Mapped[str]=mapped_column(String(80),index=True);parameter:Mapped[str]=mapped_column(String(30));value:Mapped[float]=mapped_column(Float);threshold:Mapped[float]=mapped_column(Float);severity:Mapped[str]=mapped_column(String(16));message:Mapped[str]=mapped_column(String(255));created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc),index=True);acknowledged:Mapped[bool]=mapped_column(Boolean,default=False);resolved_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True);email_last_attempt_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True);email_sent_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True);device_id:Mapped[str]=mapped_column(String(80),index=True);parameter:Mapped[str]=mapped_column(String(30));value:Mapped[float]=mapped_column(Float);threshold:Mapped[float]=mapped_column(Float);severity:Mapped[str]=mapped_column(String(16));message:Mapped[str]=mapped_column(String(255));created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc),index=True);acknowledged:Mapped[bool]=mapped_column(Boolean,default=False);resolved_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True);email_last_attempt_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True);email_sent_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True);email_last_error:Mapped[str|None]=mapped_column(String(255),nullable=True)
 class ThresholdRow(Base):
     __tablename__='thresholds'
     id:Mapped[int]=mapped_column(Integer,primary_key=True,default=1);ph_min:Mapped[float]=mapped_column(Float,default=6.5);ph_max:Mapped[float]=mapped_column(Float,default=8.5);tds_max:Mapped[float]=mapped_column(Float,default=500);turbidity_max:Mapped[float]=mapped_column(Float,default=5);temperature_min:Mapped[float]=mapped_column(Float,default=10);temperature_max:Mapped[float]=mapped_column(Float,default=35)
@@ -134,7 +134,7 @@ def eval_alerts(db,r,ts):
         last_attempt=recent_model.email_last_attempt_at
         retry_due=last_attempt is None or (ts-(last_attempt.replace(tzinfo=timezone.utc) if last_attempt.tzinfo is None else last_attempt))>=timedelta(minutes=10)
         if smtp_configured and recent_model.email_sent_at is None and retry_due:
-            recent_model.email_last_attempt_at=ts;email_alert=recent_model
+            recent_model.email_last_attempt_at=ts;recent_model.email_last_error=None;email_alert=recent_model
     db.commit()
     for a in created:db.refresh(a);log.warning('Alert generated id=%s device=%s parameter=%s',a.id,a.device_id,a.parameter)
     if email_alert:db.refresh(email_alert)
@@ -150,15 +150,26 @@ def send_model_alert_email(alert:dict[str,Any]):
             server.starttls(context=ssl.create_default_context());server.login(settings.smtp_username,settings.smtp_password);server.send_message(msg)
         with Session() as db:
             row=db.get(AlertRow,int(alert['id']))
-            if row:row.email_sent_at=datetime.now(timezone.utc);db.commit()
+            if row:row.email_sent_at=datetime.now(timezone.utc);row.email_last_error=None;db.commit()
         log.info('Poor-quality alert email sent recipient=%s alert_id=%s',settings.alert_email_to,alert['id'])
-    except Exception:log.exception('Unable to send poor-quality alert email alert_id=%s',alert.get('id'))
+    except Exception as error:
+        if isinstance(error,smtplib.SMTPAuthenticationError):hint='SMTP authentication failed. Check SMTP_USERNAME and use a fresh Gmail App Password.'
+        elif isinstance(error,smtplib.SMTPRecipientsRefused):hint='SMTP rejected ALERT_EMAIL_TO. Check the recipient address.'
+        elif isinstance(error,smtplib.SMTPSenderRefused):hint='SMTP rejected SMTP_FROM_EMAIL. Check that it matches the authenticated sender.'
+        elif isinstance(error,(smtplib.SMTPConnectError,smtplib.SMTPServerDisconnected,TimeoutError,ConnectionError,ssl.SSLError)):hint='Could not establish SMTP/TLS connection. Check SMTP_HOST, SMTP_PORT, and TLS access.'
+        elif isinstance(error,smtplib.SMTPException):hint=f'SMTP delivery failed ({type(error).__name__}). Check the SMTP settings and Render logs.'
+        else:hint=f'Email delivery failed ({type(error).__name__}). Check Render logs.'
+        with Session() as db:
+            row=db.get(AlertRow,int(alert['id']))
+            if row:row.email_last_error=hint;db.commit()
+        log.error('Unable to send poor-quality alert email alert_id=%s error_type=%s hint=%s',alert.get('id'),type(error).__name__,hint)
 @asynccontextmanager
 async def lifespan(app:FastAPI):
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
         connection.execute(text('ALTER TABLE alerts ADD COLUMN IF NOT EXISTS email_last_attempt_at TIMESTAMPTZ'))
         connection.execute(text('ALTER TABLE alerts ADD COLUMN IF NOT EXISTS email_sent_at TIMESTAMPTZ'))
+        connection.execute(text('ALTER TABLE alerts ADD COLUMN IF NOT EXISTS email_last_error VARCHAR(255)'))
     with Session() as db:
         thresholds(db)
         if not db.get(DeviceRow,'WQM-001'):
