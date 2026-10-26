@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     smtp_username: str = ''
     smtp_password: str = ''
     smtp_from_email: str = ''
+    default_turbidity_ntu: float = Field(default=2.8, ge=0, le=10000)
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
 settings=Settings()
 if settings.app_env.lower()=='production' and (settings.auth_password=='water123' or settings.auth_token_secret=='local-demo-secret-change-me'):
@@ -225,7 +226,10 @@ async def create_reading(payload:ReadingIn,background_tasks:BackgroundTasks):
         with Session() as db:
             d=db.get(DeviceRow,payload.device_id)
             if not d:d=DeviceRow(device_id=payload.device_id);db.add(d);db.flush()
-            d.last_seen=ts;d.status='ONLINE';r=ReadingRow(device_id=payload.device_id,ph=payload.ph,tds=payload.tds,turbidity=payload.turbidity,temperature=payload.temperature,created_at=ts);db.add(r);db.commit();db.refresh(r);created,email_alert=eval_alerts(db,r,ts);out=serialize(r);dev=serialize(d)
+            # Turbidity is temporarily fixed while its sensor is unavailable.
+            # Keep accepting the ESP32 payload unchanged, but use the backend
+            # configured default for storage, alerts, model scoring, and UI.
+            d.last_seen=ts;d.status='ONLINE';r=ReadingRow(device_id=payload.device_id,ph=payload.ph,tds=payload.tds,turbidity=settings.default_turbidity_ntu,temperature=payload.temperature,created_at=ts);db.add(r);db.commit();db.refresh(r);created,email_alert=eval_alerts(db,r,ts);out=serialize(r);dev=serialize(d)
         await manager.publish({'type':'reading.created','reading':out,'device':dev,'model_assessment':model_assessment(r)})
         if email_alert:background_tasks.add_task(send_model_alert_email,email_alert)
         for a in created:
